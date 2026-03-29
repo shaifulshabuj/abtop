@@ -460,22 +460,22 @@ fn draw_tokens_panel(f: &mut Frame, app: &App, area: Rect) {
     let selected = app.sessions.get(app.selected);
     let total_in: u64 = selected.map(|s| s.total_input_tokens).unwrap_or(0);
     let total_out: u64 = selected.map(|s| s.total_output_tokens).unwrap_or(0);
-    let total_cache: u64 = selected
-        .map(|s| s.total_cache_read + s.total_cache_create)
-        .unwrap_or(0);
-    let total: u64 = total_in + total_out + total_cache;
+    let cache_read: u64 = selected.map(|s| s.total_cache_read).unwrap_or(0);
+    let cache_write: u64 = selected.map(|s| s.total_cache_create).unwrap_or(0);
+    let total: u64 = total_in + total_out + cache_read + cache_write;
     let turns: u32 = selected.map(|s| s.turn_count).unwrap_or(0);
     let avg = if turns > 0 { total / turns as u64 } else { 0 };
 
     // Compute percentages for mini meter bars
-    let (in_pct, out_pct, cache_pct) = if total > 0 {
+    let (in_pct, out_pct, cache_r_pct, cache_w_pct) = if total > 0 {
         (
             total_in as f64 / total as f64 * 100.0,
             total_out as f64 / total as f64 * 100.0,
-            total_cache as f64 / total as f64 * 100.0,
+            cache_read as f64 / total as f64 * 100.0,
+            cache_write as f64 / total as f64 * 100.0,
         )
     } else {
-        (0.0, 0.0, 0.0)
+        (0.0, 0.0, 0.0, 0.0)
     };
 
     let free_grad = make_gradient(FREE_START, FREE_MID, FREE_END);
@@ -506,10 +506,17 @@ fn draw_tokens_panel(f: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(grad_at(&used_grad, 80.0)),
     ));
 
-    let mut cache_line = vec![styled_label(" Cache: ")];
-    cache_line.extend(meter_bar(cache_pct, bar_w, &cached_grad));
-    cache_line.push(Span::styled(
-        format!(" {}", fmt_tokens(total_cache)),
+    let mut cache_r_line = vec![styled_label(" CacheR:")];
+    cache_r_line.extend(meter_bar(cache_r_pct, bar_w, &cached_grad));
+    cache_r_line.push(Span::styled(
+        format!(" {}", fmt_tokens(cache_read)),
+        Style::default().fg(grad_at(&cached_grad, 80.0)),
+    ));
+
+    let mut cache_w_line = vec![styled_label(" CacheW:")];
+    cache_w_line.extend(meter_bar(cache_w_pct, bar_w, &cached_grad));
+    cache_w_line.push(Span::styled(
+        format!(" {}", fmt_tokens(cache_write)),
         Style::default().fg(grad_at(&cached_grad, 80.0)),
     ));
 
@@ -534,7 +541,8 @@ fn draw_tokens_panel(f: &mut Frame, app: &App, area: Rect) {
         Line::from(total_line),
         Line::from(input_line),
         Line::from(output_line),
-        Line::from(cache_line),
+        Line::from(cache_r_line),
+        Line::from(cache_w_line),
         Line::from(spark_line_spans),
         Line::from(vec![
             styled_label(" Turns: "),
