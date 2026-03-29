@@ -199,20 +199,26 @@ impl CodexCollector {
             0.0
         };
 
-        // Children
+        // Children: collect all descendants recursively (not just direct children)
+        // so we catch grandchild processes that listen on ports.
         let mut children = Vec::new();
         if let Some(p) = pid {
-            if let Some(child_pids) = children_map.get(&p) {
-                for &cpid in child_pids {
-                    if let Some(cproc) = process_info.get(&cpid) {
-                        let port = ports.get(&cpid).and_then(|v| v.first().copied());
-                        children.push(ChildProcess {
-                            pid: cpid,
-                            command: cproc.command.clone(),
-                            mem_kb: cproc.rss_kb,
-                            port,
-                        });
-                    }
+            let mut stack: Vec<u32> = children_map
+                .get(&p)
+                .cloned()
+                .unwrap_or_default();
+            while let Some(cpid) = stack.pop() {
+                if let Some(cproc) = process_info.get(&cpid) {
+                    let port = ports.get(&cpid).and_then(|v| v.first().copied());
+                    children.push(ChildProcess {
+                        pid: cpid,
+                        command: cproc.command.clone(),
+                        mem_kb: cproc.rss_kb,
+                        port,
+                    });
+                }
+                if let Some(grandchildren) = children_map.get(&cpid) {
+                    stack.extend(grandchildren);
                 }
             }
         }

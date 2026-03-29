@@ -214,17 +214,25 @@ impl ClaudeCollector {
         };
 
         let mut children = Vec::new();
-        if let Some(child_pids) = children_map.get(&sf.pid) {
-            for &cpid in child_pids {
-                if let Some(cproc) = process_info.get(&cpid) {
-                    let port = ports.get(&cpid).and_then(|v| v.first().copied());
-                    children.push(ChildProcess {
-                        pid: cpid,
-                        command: cproc.command.clone(),
-                        mem_kb: cproc.rss_kb,
-                        port,
-                    });
-                }
+        // Collect all descendants (not just direct children) so we catch
+        // grandchild processes that listen on ports (e.g. Claude → shell → node).
+        let mut stack: Vec<u32> = children_map
+            .get(&sf.pid)
+            .cloned()
+            .unwrap_or_default();
+        while let Some(cpid) = stack.pop() {
+            if let Some(cproc) = process_info.get(&cpid) {
+                let port = ports.get(&cpid).and_then(|v| v.first().copied());
+                children.push(ChildProcess {
+                    pid: cpid,
+                    command: cproc.command.clone(),
+                    mem_kb: cproc.rss_kb,
+                    port,
+                });
+            }
+            // Add grandchildren to the stack
+            if let Some(grandchildren) = children_map.get(&cpid) {
+                stack.extend(grandchildren);
             }
         }
 
