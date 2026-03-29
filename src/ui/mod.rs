@@ -686,10 +686,15 @@ fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect) {
         let selected = i == app.selected;
         let marker = if selected { "►" } else { " " };
 
-        let agent_icon = match session.agent_cli {
-            "claude" => ("✦", Color::Rgb(217, 119, 60)),  // Claude orange
-            "codex"  => ("◇", Color::Rgb(16, 163, 127)),  // Codex green
-            _        => ("?", INACTIVE_FG),
+        let (agent_label, agent_color) = match session.agent_cli {
+            "claude" => ("*CC", Color::Rgb(217, 119, 87)),  // #D97757 terracotta
+            "codex"  => (">CD", Color::Rgb(122, 157, 255)), // #7A9DFF periwinkle
+            other => {
+                // Future agents: uppercase first 3 chars of name
+                let fallback: String = other.chars().take(3).collect::<String>().to_uppercase();
+                // Leak to get 'static — bounded by number of distinct agent types
+                (Box::leak(fallback.into_boxed_str()) as &str, INACTIVE_FG)
+            }
         };
 
         let (status_icon, status_color) = match &session.status {
@@ -727,7 +732,7 @@ fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect) {
         rows.push(
             Row::new(vec![
                 Cell::from(Span::styled(marker, Style::default().fg(HI_FG))),
-                Cell::from(Span::styled(agent_icon.0, Style::default().fg(agent_icon.1))),
+                Cell::from(Span::styled(agent_label, Style::default().fg(agent_color))),
                 Cell::from(Span::styled(
                     format!("{}", session.pid),
                     Style::default().fg(MAIN_FG),
@@ -804,7 +809,7 @@ fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect) {
         .add_modifier(Modifier::BOLD);
     let header = Row::new(vec![
         Cell::from(""),
-        Cell::from(""),
+        Cell::from(Span::styled("AI", header_style)),
         Cell::from(Span::styled("Pid", header_style)),
         Cell::from(Span::styled("Project", header_style)),
         Cell::from(Span::styled("Sess", header_style)),
@@ -820,7 +825,7 @@ fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect) {
 
     let widths = [
         Constraint::Length(1),   // marker
-        Constraint::Length(2),   // agent icon (✦/◇)
+        Constraint::Length(3),   // agent label (*CC/>CD)
         Constraint::Length(6),   // pid
         Constraint::Length(14),  // project
         Constraint::Length(9),   // session id (8 chars + pad)
