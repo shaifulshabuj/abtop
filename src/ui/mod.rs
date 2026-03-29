@@ -842,17 +842,20 @@ fn draw_projects_panel(f: &mut Frame, app: &App, area: Rect) {
 // ── ports panel — maps to btop's ³net ────────────────────────────────────────
 
 fn draw_ports_panel(f: &mut Frame, app: &App, area: Rect) {
-    let mut all_ports: Vec<(u16, String, String, u32)> = Vec::new();
+    // Collect (port, project_name, session_id_short)
+    let mut all_ports: Vec<(u16, String, String)> = Vec::new();
     for session in &app.sessions {
+        let sid_short = if session.session_id.len() >= 8 {
+            &session.session_id[..8]
+        } else {
+            &session.session_id
+        };
         for child in &session.children {
             if let Some(port) = child.port {
-                let cmd = child.command.split_whitespace().next().unwrap_or("?");
-                let cmd = cmd.rsplit('/').next().unwrap_or(cmd);
                 all_ports.push((
                     port,
                     session.project_name.clone(),
-                    cmd.to_string(),
-                    child.pid,
+                    sid_short.to_string(),
                 ));
             }
         }
@@ -861,7 +864,7 @@ fn draw_ports_panel(f: &mut Frame, app: &App, area: Rect) {
 
     let mut port_counts: std::collections::HashMap<u16, usize> =
         std::collections::HashMap::new();
-    for (port, _, _, _) in &all_ports {
+    for (port, _, _) in &all_ports {
         *port_counts.entry(*port).or_default() += 1;
     }
 
@@ -870,11 +873,9 @@ fn draw_ports_panel(f: &mut Frame, app: &App, area: Rect) {
     let header_style = Style::default().fg(MAIN_FG).add_modifier(Modifier::BOLD);
     let mut lines = vec![Line::from(vec![
         Span::styled(" PORT  ", header_style),
-        Span::styled("SESSION    ", header_style),
-        Span::styled("CMD      ", header_style),
-        Span::styled("PID", header_style),
+        Span::styled("SESSION", header_style),
     ])];
-    for (port, proj, cmd, pid) in &all_ports {
+    for (port, proj, sid) in &all_ports {
         let conflict = port_counts.get(port).copied().unwrap_or(0) > 1;
         let color = if conflict {
             grad_at(&proc_grad, 100.0)
@@ -882,36 +883,20 @@ fn draw_ports_panel(f: &mut Frame, app: &App, area: Rect) {
             PROC_MISC
         };
         let warn = if conflict { " ⚠" } else { "" };
+        let session_label = format!("{} {}{}", proj, sid, warn);
         lines.push(Line::from(vec![
             Span::styled(format!(" :{:<5}", port), Style::default().fg(color)),
-            Span::styled(
-                format!("{:<10}", truncate_str(proj, 10)),
-                Style::default().fg(MAIN_FG),
-            ),
-            Span::styled(
-                format!("{:<8}", truncate_str(cmd, 8)),
-                Style::default().fg(GRAPH_TEXT),
-            ),
-            Span::styled(format!("{}{}", pid, warn), Style::default().fg(color)),
+            Span::styled(session_label, Style::default().fg(MAIN_FG)),
         ]));
     }
 
     // Orphan ports: processes whose parent session has ended but port is still open
     let orphan_color = grad_at(&proc_grad, 100.0);
     for orphan in &app.orphan_ports {
-        let cmd = orphan.command.split_whitespace().next().unwrap_or("?");
-        let cmd = cmd.rsplit('/').next().unwrap_or(cmd);
+        let session_label = format!("{} ⚠orphan", orphan.project_name);
         lines.push(Line::from(vec![
             Span::styled(format!(" :{:<5}", orphan.port), Style::default().fg(orphan_color)),
-            Span::styled(
-                format!("{:<10}", truncate_str(&orphan.project_name, 10)),
-                Style::default().fg(orphan_color),
-            ),
-            Span::styled(
-                format!("{:<8}", truncate_str(cmd, 8)),
-                Style::default().fg(orphan_color),
-            ),
-            Span::styled(format!("{} ⚠orphan", orphan.pid), Style::default().fg(orphan_color)),
+            Span::styled(session_label, Style::default().fg(orphan_color)),
         ]));
     }
 
