@@ -2,6 +2,7 @@
 name = "abtop"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.88"
 description = "AI agent monitor for your terminal"
 license = "MIT"
 repository = "https://github.com/graykode/abtop"
