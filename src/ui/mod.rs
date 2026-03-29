@@ -259,7 +259,7 @@ fn draw_context_panel(f: &mut Frame, app: &App, area: Rect) {
     // Split: left = sparkline graph, right = context bars
     let halves = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
         .split(inner);
 
     // ── Left: token rate braille sparkline graph ──
@@ -282,7 +282,7 @@ fn draw_context_sparkline(f: &mut Frame, app: &App, area: Rect, cpu_grad: &[Colo
 
     // Graph title
     lines.push(Line::from(vec![
-        Span::styled(" Token Rate", Style::default().fg(TITLE).add_modifier(Modifier::BOLD)),
+        Span::styled(" Tokens/tick", Style::default().fg(GRAPH_TEXT)),
     ]));
 
     // Render sparkline across available rows using braille
@@ -315,7 +315,7 @@ fn draw_context_bars(f: &mut Frame, app: &App, area: Rect, cpu_grad: &[Color; 10
     let header_style = Style::default().fg(MAIN_FG).add_modifier(Modifier::BOLD);
 
     // bar width = remaining space after Project(14) + Session(9) + pct(5) + padding
-    let bar_width = (area.width as usize).saturating_sub(30).min(30).max(4);
+    let bar_width = (area.width as usize).saturating_sub(30).min(20).max(4);
 
     let mut rows = Vec::new();
 
