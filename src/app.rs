@@ -75,11 +75,12 @@ impl App {
             self.token_rates.pop_front();
         }
 
-        // Poll rate limits less frequently (every 5 ticks ≈ 10s)
-        self.rate_limit_counter += 1;
-        if self.rate_limit_counter >= 5 {
+        // Poll rate limits: first tick immediately, then every 5 ticks ≈ 10s
+        if self.rate_limits.is_empty() || self.rate_limit_counter >= 5 {
             self.rate_limit_counter = 0;
             self.rate_limits = read_rate_limits();
+        } else {
+            self.rate_limit_counter += 1;
         }
 
         // Drain completed summaries from background threads

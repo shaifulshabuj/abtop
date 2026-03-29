@@ -839,7 +839,7 @@ fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect) {
                 Cell::from(""),
                 Cell::from(""),
                 Cell::from(Span::styled(
-                    format!("└─ {}", truncate_str(&session.current_task, 50)),
+                    format!("└─ {}", truncate_str(&session.current_tasks.first().map(|s| s.as_str()).unwrap_or(""), 50)),
                     Style::default().fg(GRAPH_TEXT),
                 )),
                 Cell::from(""),
