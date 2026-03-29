@@ -1,6 +1,8 @@
 # abtop
 
-AI agent monitor for your terminal. Like `btop++`, but for AI coding agents.
+A monitor for AI coding agents.
+
+Inspired by [htop](https://github.com/htop-dev/htop) and [btop](https://github.com/aristocratos/btop).
 
 Currently supports **Claude Code** and **Codex CLI**.
 
