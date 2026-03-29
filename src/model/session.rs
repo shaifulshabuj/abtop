@@ -36,6 +36,15 @@ pub struct ChildProcess {
     pub port: Option<u16>,
 }
 
+/// A port left open by a process whose parent session has ended.
+#[derive(Debug, Clone)]
+pub struct OrphanPort {
+    pub port: u16,
+    pub pid: u32,
+    pub command: String,
+    pub project_name: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct SubAgent {
     pub name: String,
@@ -83,6 +92,12 @@ pub struct AgentSession {
 impl AgentSession {
     pub fn total_tokens(&self) -> u64 {
         self.total_input_tokens + self.total_output_tokens + self.total_cache_read + self.total_cache_create
+    }
+
+    /// Tokens that represent new work (input + output), excluding cache hits.
+    /// Used for rate calculation to avoid inflated numbers from cache_read.
+    pub fn active_tokens(&self) -> u64 {
+        self.total_input_tokens + self.total_output_tokens + self.total_cache_create
     }
 
     pub fn elapsed(&self) -> Duration {
