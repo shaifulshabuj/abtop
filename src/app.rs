@@ -244,43 +244,21 @@ impl App {
     }
 
     /// Jump to the terminal running the selected session's Claude process.
-    /// Tries tmux first, then iTerm2/Terminal.app via AppleScript on macOS.
-    /// Returns a message string for the UI status bar, or None on success.
-    pub fn jump_to_session(&self) -> Option<String> {
+    /// In tmux: switch to the pane. Otherwise: show a helpful status message.
+    pub fn jump_to_session(&mut self) -> Option<String> {
         if self.sessions.is_empty() {
             return None;
         }
         let session = &self.sessions[self.selected];
         let target_pid = session.pid;
 
-        // Try tmux first if we're inside tmux
+        // tmux: actual jump
         if std::env::var("TMUX").is_ok() {
-            if let Some(msg) = self.jump_via_tmux(target_pid) {
-                return Some(msg);
-            }
-            return None;
+            return self.jump_via_tmux(target_pid);
         }
 
-        // Fallback: macOS terminal app via AppleScript
-        #[cfg(target_os = "macos")]
-        {
-            // Find the tty of the target process
-            let tty = find_tty_for_pid(target_pid);
-            if let Some(tty) = tty {
-                // Try iTerm2 first, then Terminal.app
-                if jump_iterm2_by_tty(&tty) {
-                    return None;
-                }
-                if jump_terminal_app_by_tty(&tty) {
-                    return None;
-                }
-            }
-            Some("tab not found".to_string())
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Some("tmux required".to_string())
-        }
+        // No tmux: no action
+        None
     }
 
     fn jump_via_tmux(&self, target_pid: u32) -> Option<String> {
@@ -498,93 +476,6 @@ fn is_descendant_of(target: u32, ancestor: u32) -> bool {
         }
     }
     false
-}
-
-/// Find the controlling tty for a PID (walks up process tree to find one with a tty).
-#[cfg(target_os = "macos")]
-fn find_tty_for_pid(pid: u32) -> Option<String> {
-    let output = std::process::Command::new("ps")
-        .args(["-o", "tty=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
-    let tty = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if tty.is_empty() || tty == "??" {
-        // Walk up to parent
-        let ppid_out = std::process::Command::new("ps")
-            .args(["-o", "ppid=", "-p", &pid.to_string()])
-            .output()
-            .ok()?;
-        let ppid: u32 = String::from_utf8_lossy(&ppid_out.stdout).trim().parse().ok()?;
-        if ppid <= 1 || ppid == pid {
-            return None;
-        }
-        return find_tty_for_pid(ppid);
-    }
-    Some(tty)
-}
-
-/// Jump to an iTerm2 tab/session by matching the tty.
-#[cfg(target_os = "macos")]
-fn jump_iterm2_by_tty(tty: &str) -> bool {
-    let script = format!(
-        r#"tell application "System Events"
-    if not (exists process "iTerm2") then return false
-end tell
-tell application "iTerm2"
-    repeat with w in windows
-        repeat with t in tabs of w
-            repeat with s in sessions of t
-                if tty of s ends with "{tty}" then
-                    select t
-                    set index of w to 1
-                    activate
-                    return true
-                end if
-            end repeat
-        end repeat
-    end repeat
-end tell
-return false"#,
-        tty = tty
-    );
-    let output = std::process::Command::new("osascript")
-        .args(["-e", &script])
-        .output();
-    match output {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).trim() == "true",
-        Err(_) => false,
-    }
-}
-
-/// Jump to a Terminal.app tab by matching the tty.
-#[cfg(target_os = "macos")]
-fn jump_terminal_app_by_tty(tty: &str) -> bool {
-    let script = format!(
-        r#"tell application "System Events"
-    if not (exists process "Terminal") then return false
-end tell
-tell application "Terminal"
-    repeat with w in windows
-        repeat with t in tabs of w
-            if tty of t ends with "{tty}" then
-                set selected tab of w to t
-                set index of w to 1
-                activate
-                return true
-            end if
-        end repeat
-    end repeat
-end tell
-return false"#,
-        tty = tty
-    );
-    let output = std::process::Command::new("osascript")
-        .args(["-e", &script])
-        .output();
-    match output {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).trim() == "true",
-        Err(_) => false,
-    }
 }
 
 fn save_summary_cache(summaries: &HashMap<String, String>) {

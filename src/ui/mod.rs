@@ -546,7 +546,7 @@ fn draw_context_bars(f: &mut Frame, app: &App, area: Rect, cpu_grad: &[Color; 10
 fn draw_quota_panel(f: &mut Frame, app: &App, area: Rect) {
     let cpu_grad = make_gradient(CPU_START, CPU_MID, CPU_END);
 
-    let block = btop_block("quota", "²", CPU_BOX);
+    let block = btop_block("quota(left)", "²", CPU_BOX);
     f.render_widget(block, area);
 
     let inner = Rect {
@@ -1463,18 +1463,15 @@ fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect) {
 // ── footer — btop style: ↑ select ↓ info ↵ terminate ── ─────────────────────
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let jump_available = std::env::var("TMUX").is_ok() || cfg!(target_os = "macos");
+    let has_tmux = std::env::var("TMUX").is_ok();
 
     let mut spans = vec![
         Span::styled(" ↑↓", Style::default().fg(HI_FG)),
         Span::styled(" select ", Style::default().fg(MAIN_FG)),
     ];
-    if jump_available {
+    if has_tmux {
         spans.push(Span::styled("↵", Style::default().fg(HI_FG)));
         spans.push(Span::styled(" jump ", Style::default().fg(MAIN_FG)));
-    } else {
-        spans.push(Span::styled("↵", Style::default().fg(INACTIVE_FG)));
-        spans.push(Span::styled(" jump ", Style::default().fg(INACTIVE_FG)));
     }
     spans.push(Span::styled("x", Style::default().fg(HI_FG)));
     spans.push(Span::styled(" kill ", Style::default().fg(MAIN_FG)));
