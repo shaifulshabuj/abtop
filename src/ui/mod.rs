@@ -356,6 +356,19 @@ fn draw_top_panel(f: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(TITLE).add_modifier(Modifier::BOLD),
     )));
 
+    // Column header: align with data rows using same widths
+    {
+        let hdr_label = format!(" {:<2} {:<w$}", "#", "Project  Sess", w = name_w);
+        let mut hdr_spans = vec![Span::styled(
+            hdr_label,
+            Style::default().fg(GRAPH_TEXT),
+        )];
+        // pad bar area then show "Context" label right-aligned over bar+pct
+        let ctx_hdr = format!("{:>w$}", "Context", w = bar_width + 5);
+        hdr_spans.push(Span::styled(ctx_hdr, Style::default().fg(GRAPH_TEXT)));
+        lines.push(Line::from(hdr_spans));
+    }
+
     for (i, session) in app.sessions.iter().enumerate() {
         let raw_pct = session.context_percent;
         let bar_pct = raw_pct.min(100.0);
