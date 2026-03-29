@@ -364,15 +364,17 @@ fn draw_top_panel(f: &mut Frame, app: &App, area: Rect) {
         let warn = if raw_pct >= 90.0 { " ⚠" } else { "" };
         let pct_color = grad_at(&cpu_grad, bar_pct);
 
-        let display_name = if session.initial_prompt.is_empty() {
-            &session.project_name
+        // Context panel: show project name + short session id for identification
+        let sid_short = if session.session_id.len() >= 6 {
+            &session.session_id[..6]
         } else {
-            &session.initial_prompt
+            &session.session_id
         };
+        let ctx_label = format!("{} {}", session.project_name, sid_short);
         let label = format!(
             " S{} {:<w$}",
             i + 1,
-            truncate_str(display_name, name_w),
+            truncate_str(&ctx_label, name_w),
             w = name_w
         );
         let mut spans = vec![Span::styled(label, Style::default().fg(MAIN_FG))];
@@ -402,15 +404,14 @@ fn draw_top_panel(f: &mut Frame, app: &App, area: Rect) {
 // ── tokens panel — maps to btop's ²mem panel ────────────────────────────────
 
 fn draw_tokens_panel(f: &mut Frame, app: &App, area: Rect) {
-    let total_in: u64 = app.sessions.iter().map(|s| s.total_input_tokens).sum();
-    let total_out: u64 = app.sessions.iter().map(|s| s.total_output_tokens).sum();
-    let total_cache: u64 = app
-        .sessions
-        .iter()
+    let selected = app.sessions.get(app.selected);
+    let total_in: u64 = selected.map(|s| s.total_input_tokens).unwrap_or(0);
+    let total_out: u64 = selected.map(|s| s.total_output_tokens).unwrap_or(0);
+    let total_cache: u64 = selected
         .map(|s| s.total_cache_read + s.total_cache_create)
-        .sum();
+        .unwrap_or(0);
     let total: u64 = total_in + total_out + total_cache;
-    let turns: u32 = app.sessions.iter().map(|s| s.turn_count).sum();
+    let turns: u32 = selected.map(|s| s.turn_count).unwrap_or(0);
     let avg = if turns > 0 { total / turns as u64 } else { 0 };
 
     // Compute percentages for mini meter bars
@@ -493,7 +494,12 @@ fn draw_tokens_panel(f: &mut Frame, app: &App, area: Rect) {
         ]),
     ];
 
-    let block = btop_block("tokens", "²", MEM_BOX);
+    let panel_title = if let Some(s) = selected {
+        format!("tokens ({})", truncate_str(&s.project_name, 12))
+    } else {
+        "tokens".to_string()
+    };
+    let block = btop_block(&panel_title, "²", MEM_BOX);
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
