@@ -85,7 +85,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, demo_mode: boo
         terminal.draw(|f| ui::draw(f, &app))?;
 
         // Poll at 500ms for smooth animations; data tick every 2s
-        if event::poll(render_interval)? {
+        let had_input = if event::poll(render_interval)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     match key.code {
@@ -104,15 +104,18 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, demo_mode: boo
                     }
                 }
             }
-        }
+            true
+        } else {
+            false
+        };
 
         if demo_mode {
             // Rotate token rates to animate the sparkline
             if let Some(front) = app.token_rates.pop_front() {
                 app.token_rates.push_back(front);
             }
-        } else if last_tick.elapsed() >= tick_interval {
-            // Data tick every 2s
+        } else if !had_input && last_tick.elapsed() >= tick_interval {
+            // Data tick every 2s — skip when handling input to avoid lag
             app.tick();
             last_tick = std::time::Instant::now();
         }
