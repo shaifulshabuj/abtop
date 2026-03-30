@@ -1,5 +1,5 @@
 use crate::app::App;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table};
@@ -274,9 +274,48 @@ fn styled_label(text: &str) -> Span<'static> {
 
 // ── main draw ────────────────────────────────────────────────────────────────
 
+const MIN_WIDTH: u16 = 80;
+const MIN_HEIGHT: u16 = 24;
+
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
+    let w = area.width;
     let h = area.height;
+
+    if w < MIN_WIDTH || h < MIN_HEIGHT {
+        let msg = vec![
+            Line::from(Span::styled(
+                "Terminal size too small:",
+                Style::default().fg(MAIN_FG).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(vec![
+                Span::styled("Width = ", Style::default().fg(MAIN_FG)),
+                Span::styled(
+                    w.to_string(),
+                    Style::default().fg(if w < MIN_WIDTH { Color::Red } else { Color::Green }),
+                ),
+                Span::styled(" Height = ", Style::default().fg(MAIN_FG)),
+                Span::styled(
+                    h.to_string(),
+                    Style::default().fg(if h < MIN_HEIGHT { Color::Red } else { Color::Green }),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Needed for current config:",
+                Style::default().fg(MAIN_FG).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!("Width = {} Height = {}", MIN_WIDTH, MIN_HEIGHT),
+                Style::default().fg(MAIN_FG),
+            )),
+        ];
+        let block = Paragraph::new(msg).alignment(Alignment::Center);
+        let y = h / 2 - 2;
+        let msg_area = Rect { x: 0, y, width: w, height: 5.min(h.saturating_sub(y)) };
+        f.render_widget(block, msg_area);
+        return;
+    }
 
     // Layout priority: sessions first → mid → context (only with surplus space)
     // Sessions get their full ideal height before anything else.
