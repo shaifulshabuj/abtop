@@ -201,7 +201,7 @@ impl ClaudeCollector {
             }
         };
 
-        let context_window = context_window_for_model(&model);
+        let context_window = context_window_for_model(&model, last_context_tokens);
         let context_percent = if context_window > 0 {
             (last_context_tokens as f64 / context_window as f64) * 100.0
         } else {
@@ -738,8 +738,8 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-fn context_window_for_model(model: &str) -> u64 {
-    if model.contains("[1m]") {
+fn context_window_for_model(model: &str, last_context_tokens: u64) -> u64 {
+    if model.contains("[1m]") || last_context_tokens > 200_000 {
         1_000_000
     } else {
         200_000
@@ -850,10 +850,14 @@ mod tests {
 
     #[test]
     fn test_context_window_for_model() {
-        assert_eq!(context_window_for_model("claude-opus-4-6"), 200_000);
-        assert_eq!(context_window_for_model("claude-opus-4-6[1m]"), 1_000_000);
-        assert_eq!(context_window_for_model("claude-sonnet-4-6"), 200_000);
-        assert_eq!(context_window_for_model("unknown-model"), 200_000);
+        // Base model with low token usage → 200K
+        assert_eq!(context_window_for_model("claude-opus-4-6", 50_000), 200_000);
+        // Explicit [1m] suffix → 1M regardless of token count
+        assert_eq!(context_window_for_model("claude-opus-4-6[1m]", 0), 1_000_000);
+        assert_eq!(context_window_for_model("claude-sonnet-4-6", 100_000), 200_000);
+        assert_eq!(context_window_for_model("unknown-model", 0), 200_000);
+        // Token usage exceeds 200K → must be 1M window
+        assert_eq!(context_window_for_model("claude-opus-4-6", 250_000), 1_000_000);
     }
 
     #[test]
