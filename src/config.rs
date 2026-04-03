@@ -35,7 +35,14 @@ pub fn load_config() -> AppConfig {
         }
         if let Some((key, val)) = line.split_once('=') {
             let key = key.trim();
-            let val = val.trim().trim_matches('"');
+            // Strip quotes (double or single) and inline comments
+            let val = val.trim();
+            let val = if let Some(comment_pos) = val.find('#') {
+                val[..comment_pos].trim()
+            } else {
+                val
+            };
+            let val = val.trim_matches('"').trim_matches('\'');
             if key == "theme" {
                 config.theme = val.to_string();
             }
@@ -59,7 +66,10 @@ pub fn save_theme(name: &str) -> Result<(), String> {
     let mut lines: Vec<String> = Vec::new();
     let mut found = false;
     for line in content.lines() {
-        if line.trim_start().starts_with("theme") && line.contains('=') {
+        let is_theme_key = line.split_once('=')
+            .map(|(k, _)| k.trim() == "theme")
+            .unwrap_or(false);
+        if is_theme_key {
             lines.push(format!("theme = \"{}\"", name));
             found = true;
         } else {
