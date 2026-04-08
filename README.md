@@ -84,7 +84,7 @@ tmux new -s work
 
 ## Themes
 
-6 built-in themes. Press `t` to cycle at runtime, or launch with `--theme <name>`. Your choice is saved to `~/.config/abtop/config.toml`.
+10 built-in themes, including 4 colorblind-friendly options (`high-contrast`, `protanopia`, `deuteranopia`, `tritanopia`). Press `t` to cycle at runtime, or launch with `--theme <name>`. Your choice is saved to `~/.config/abtop/config.toml`.
 
 | btop (default) | dracula | catppuccin |
 |:-:|:-:|:-:|
