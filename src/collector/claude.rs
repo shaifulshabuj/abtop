@@ -274,6 +274,7 @@ impl ClaudeCollector {
             started_at: sf.started_at,
             status,
             model,
+            effort: String::new(),
             context_percent,
             total_input_tokens: total_input,
             total_output_tokens: total_output,
