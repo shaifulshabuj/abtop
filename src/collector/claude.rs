@@ -34,7 +34,8 @@ impl ClaudeCollector {
     /// /proc/<pid>/environ for each running Claude process.
     /// Always includes the default (~/.claude) and CLAUDE_CONFIG_DIR if set.
     fn refresh_config_dirs(&mut self, process_info: &HashMap<u32, process::ProcInfo>) {
-        let mut seen = std::collections::HashSet::new();
+        // BTreeSet for deterministic iteration order across runs.
+        let mut seen = std::collections::BTreeSet::new();
 
         // Always include the default directory
         let default = dirs::home_dir().unwrap_or_default().join(".claude");
@@ -313,10 +314,14 @@ impl ClaudeCollector {
             .as_ref()
             .and_then(|tp| tp.parent().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| {
-                // Use the first config dir's projects_dir as fallback
-                self.config_dirs.first()
-                    .map(|c| c.projects_dir.join(encode_cwd_path(&sf.cwd)))
+                // Fallback to the default (~/.claude) projects dir.
+                // config_dirs is sorted (BTreeSet), so ~/.claude is always
+                // first when it exists.
+                dirs::home_dir()
                     .unwrap_or_default()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_cwd_path(&sf.cwd))
             });
 
         // Subagent discovery
@@ -367,22 +372,21 @@ impl ClaudeCollector {
     fn find_transcript(&self, cwd: &str, session_id: &str) -> Option<PathBuf> {
         let jsonl_name = format!("{}.jsonl", session_id);
         let encoded = encode_cwd_path(cwd);
-        // Collect projects_dir paths to avoid borrow issues
-        let projects_dirs: Vec<&Path> = self.config_dirs.iter()
-            .map(|c| c.projects_dir.as_path())
-            .collect();
 
-        for projects_dir in projects_dirs {
-            // Primary: look up by encoded cwd
-            let path = projects_dir.join(&encoded).join(&jsonl_name);
+        // Pass 1: try the exact encoded-cwd path across all config dirs first.
+        // This avoids a worktree-fallback match in one dir shadowing the
+        // correct exact match in another dir.
+        for config in &self.config_dirs {
+            let path = config.projects_dir.join(&encoded).join(&jsonl_name);
             if path.exists() && !is_symlink(&path) {
                 return Some(path);
             }
+        }
 
-            // Fallback: scan all project directories for the session file.
-            // Handles worktree (-w) sessions where the transcript directory
-            // may not match the encoded cwd from the session file.
-            if let Ok(entries) = fs::read_dir(projects_dir) {
+        // Pass 2: scan all project subdirectories for worktree sessions
+        // where the transcript directory may not match the encoded cwd.
+        for config in &self.config_dirs {
+            if let Ok(entries) = fs::read_dir(&config.projects_dir) {
                 for entry in entries.flatten() {
                     if entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(true) {
                         continue;
@@ -907,18 +911,21 @@ fn read_effort_from_settings(path: &Path) -> Option<String> {
     }
 }
 
-/// Read a single environment variable from a running process via /proc/<pid>/environ.
-/// Returns None if the process is inaccessible or the variable is not set.
-/// The environ file contains NUL-separated KEY=VALUE pairs.
-#[cfg(target_os = "linux")]
-fn read_env_var_from_proc(pid: u32, var_name: &str) -> Option<String> {
-    let environ_path = format!("/proc/{}/environ", pid);
-    let data = fs::read(&environ_path).ok()?;
+/// Parse a NUL-separated environ blob to extract a single variable's value.
+fn parse_environ_var(data: &[u8], var_name: &str) -> Option<String> {
     let prefix = format!("{}=", var_name);
     data.split(|&b| b == 0)
         .filter_map(|entry| std::str::from_utf8(entry).ok())
         .find(|entry| entry.starts_with(&prefix))
         .map(|entry| entry[prefix.len()..].to_string())
+}
+
+/// Read a single environment variable from a running process via /proc/<pid>/environ.
+/// Returns None if the process is inaccessible or the variable is not set.
+#[cfg(target_os = "linux")]
+fn read_env_var_from_proc(pid: u32, var_name: &str) -> Option<String> {
+    let data = fs::read(format!("/proc/{}/environ", pid)).ok()?;
+    parse_environ_var(&data, var_name)
 }
 
 /// Stub for non-Linux platforms where /proc is not available.
@@ -1146,5 +1153,36 @@ mod tests {
     #[test]
     fn test_read_effort_from_settings_nonexistent_file() {
         assert!(read_effort_from_settings(Path::new("/nonexistent/nowhere.json")).is_none());
+    }
+
+    #[test]
+    fn test_parse_environ_var_found() {
+        let data = b"HOME=/root\0CLAUDE_CONFIG_DIR=/home/user/.claude-pro\0SHELL=/bin/bash\0";
+        assert_eq!(
+            parse_environ_var(data, "CLAUDE_CONFIG_DIR").as_deref(),
+            Some("/home/user/.claude-pro"),
+        );
+    }
+
+    #[test]
+    fn test_parse_environ_var_not_set() {
+        let data = b"HOME=/root\0SHELL=/bin/bash\0";
+        assert!(parse_environ_var(data, "CLAUDE_CONFIG_DIR").is_none());
+    }
+
+    #[test]
+    fn test_parse_environ_var_empty_value() {
+        let data = b"CLAUDE_CONFIG_DIR=\0OTHER=val\0";
+        assert_eq!(
+            parse_environ_var(data, "CLAUDE_CONFIG_DIR").as_deref(),
+            Some(""),
+        );
+    }
+
+    #[test]
+    fn test_parse_environ_var_no_partial_match() {
+        // CLAUDE_CONFIG_DIR_EXTRA should not match CLAUDE_CONFIG_DIR
+        let data = b"CLAUDE_CONFIG_DIR_EXTRA=/wrong\0";
+        assert!(parse_environ_var(data, "CLAUDE_CONFIG_DIR").is_none());
     }
 }
