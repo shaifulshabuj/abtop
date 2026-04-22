@@ -125,11 +125,14 @@ impl ClaudeCollector {
             }
         }
 
+        let discovery_ctx = build_discovery_context(&session_paths);
+
         let mut sessions = self.load_session_paths(
             &session_paths,
             &shared.process_info,
             &shared.children_map,
             &shared.ports,
+            &discovery_ctx,
         );
 
         // Evict transcript cache for sessions that no longer exist
@@ -148,12 +151,13 @@ impl ClaudeCollector {
         process_info: &HashMap<u32, ProcInfo>,
         children_map: &HashMap<u32, Vec<u32>>,
         ports: &HashMap<u32, Vec<u16>>,
+        ctx: &DiscoveryContext,
     ) -> Vec<AgentSession> {
         let mut sessions = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
         for (path, config) in session_paths {
             if let Some(session) =
-                self.load_session(path, config, process_info, children_map, ports)
+                self.load_session(path, config, process_info, children_map, ports, ctx)
             {
                 if seen_ids.insert(session.session_id.clone()) {
                     sessions.push(session);
@@ -246,20 +250,42 @@ impl ClaudeCollector {
         process_info: &HashMap<u32, ProcInfo>,
         children_map: &HashMap<u32, Vec<u32>>,
         ports: &HashMap<u32, Vec<u16>>,
+        ctx: &DiscoveryContext,
     ) -> Option<AgentSession> {
         let content = fs::read_to_string(path).ok()?;
         let mut sf: SessionFile = serde_json::from_str(&content).ok()?;
         sf.sanitize();
 
+        // Resolve the project dir that actually holds this session's
+        // transcripts. For worktree sessions the on-disk dir does not match
+        // `encode_cwd_path(cwd)`, so locate it via the original sid first
+        // (mirrors the fallback in `find_transcript_in_config`).
+        let project_dir = resolve_project_dir(config, &sf.cwd, &sf.session_id);
+
         // `/clear` mints a new sessionId + transcript without rewriting
         // `sessions/{PID}.json`. Override with the most recent transcript in
         // the project dir so counters/status track the live session instead
         // of the stale one. (#68)
-        if let Some(live_sid) =
-            find_live_session_id(&config.projects_dir, &sf.cwd, sf.started_at)
-        {
-            if live_sid != sf.session_id {
-                sf.session_id = live_sid;
+        //
+        // Skip the override when multiple active claude PIDs share this
+        // cwd: we can't tell which PID owns a freshly-created jsonl, and
+        // picking the wrong one would cross-contaminate counters. Also
+        // exclude sids already claimed by OTHER session files (a sibling
+        // PID's transcript must not be adopted as this PID's live sid).
+        let siblings = ctx.pids_per_cwd.get(&sf.cwd).copied().unwrap_or(1);
+        if siblings <= 1 {
+            let excluded: std::collections::HashSet<&str> = ctx
+                .claimed_sids_by_pid
+                .iter()
+                .filter(|(p, _)| **p != sf.pid)
+                .map(|(_, s)| s.as_str())
+                .collect();
+            if let Some(live_sid) =
+                find_live_session_id(project_dir.as_deref(), sf.started_at, &excluded)
+            {
+                if live_sid != sf.session_id {
+                    sf.session_id = live_sid;
+                }
             }
         }
 
@@ -280,7 +306,16 @@ impl ClaudeCollector {
         let proc = process_info.get(&sf.pid);
         let mem_mb = proc.map(|p| p.rss_kb / 1024).unwrap_or(0);
 
-        let transcript_path = Self::find_transcript_in_config(config, &sf.cwd, &sf.session_id);
+        // Use the already-resolved project_dir so a post-/clear sid lookup
+        // lands in the same (possibly worktree) directory as the original.
+        let transcript_path = project_dir.as_ref().and_then(|pd| {
+            let p = pd.join(format!("{}.jsonl", sf.session_id));
+            if p.exists() && !is_symlink(&p) {
+                Some(p)
+            } else {
+                None
+            }
+        });
 
         if let Some(ref tp) = transcript_path {
             let cached = self.transcript_cache.remove(&sf.session_id);
@@ -530,39 +565,6 @@ impl ClaudeCollector {
             pending_since_ms: cached.last_assistant_ts_ms,
             thinking_since_ms: cached.last_user_ts_ms,
         })
-    }
-
-    fn find_transcript_in_config(
-        config: &ConfigDir,
-        cwd: &str,
-        session_id: &str,
-    ) -> Option<PathBuf> {
-        let jsonl_name = format!("{}.jsonl", session_id);
-        let encoded = encode_cwd_path(cwd);
-
-        let path = config.projects_dir.join(&encoded).join(&jsonl_name);
-        if path.exists() && !is_symlink(&path) {
-            return Some(path);
-        }
-
-        // Scan project subdirectories for worktree sessions where the
-        // transcript directory may not match the encoded cwd.
-        if let Ok(entries) = fs::read_dir(&config.projects_dir) {
-            for entry in entries.flatten() {
-                if entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(true) {
-                    continue;
-                }
-                if !entry.path().is_dir() {
-                    continue;
-                }
-                let candidate = entry.path().join(&jsonl_name);
-                if candidate.exists() && !is_symlink(&candidate) {
-                    return Some(candidate);
-                }
-            }
-        }
-
-        None
     }
 
     fn collect_subagents(subagents_dir: &Path) -> Vec<SubAgent> {
@@ -838,18 +840,100 @@ fn is_claude_config_root(path: &Path) -> bool {
     path.join("sessions").is_dir() && path.join("projects").is_dir()
 }
 
-/// Find the currently-live session_id for a PID by scanning its project
-/// directory for the most recently modified transcript.
+/// Per-tick session-discovery state shared across all `load_session` calls
+/// in a single `collect_sessions` pass. Pre-parsed so each PID can reason
+/// about the sids claimed by its neighbors without re-reading every
+/// session file.
+#[derive(Default)]
+struct DiscoveryContext {
+    /// PID → sid currently recorded in its `sessions/{PID}.json`.
+    claimed_sids_by_pid: HashMap<u32, String>,
+    /// cwd → number of active session files pointing at it.
+    pids_per_cwd: HashMap<String, usize>,
+}
+
+fn build_discovery_context(session_paths: &[(PathBuf, ConfigDir)]) -> DiscoveryContext {
+    let mut claimed_sids_by_pid: HashMap<u32, String> = HashMap::new();
+    let mut pids_per_cwd: HashMap<String, usize> = HashMap::new();
+    let mut seen_pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for (path, _) in session_paths {
+        let Ok(content) = fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(mut sf) = serde_json::from_str::<SessionFile>(&content) else {
+            continue;
+        };
+        sf.sanitize();
+        if !seen_pids.insert(sf.pid) {
+            continue;
+        }
+        *pids_per_cwd.entry(sf.cwd.clone()).or_insert(0) += 1;
+        claimed_sids_by_pid.insert(sf.pid, sf.session_id);
+    }
+    DiscoveryContext {
+        claimed_sids_by_pid,
+        pids_per_cwd,
+    }
+}
+
+/// Resolve the project directory that holds this session's transcripts.
+/// Prefers `encode_cwd_path(cwd)` but falls back to any sibling subdir
+/// containing `{original_sid}.jsonl` — this is how `find_transcript_in_config`
+/// handles worktree sessions and the live-sid lookup must stay consistent.
+fn resolve_project_dir(config: &ConfigDir, cwd: &str, original_sid: &str) -> Option<PathBuf> {
+    let encoded = encode_cwd_path(cwd);
+    let primary = config.projects_dir.join(&encoded);
+    let jsonl_name = format!("{}.jsonl", original_sid);
+
+    let primary_has_original = {
+        let p = primary.join(&jsonl_name);
+        p.exists() && !is_symlink(&p)
+    };
+    if primary_has_original {
+        return Some(primary);
+    }
+
+    if let Ok(entries) = fs::read_dir(&config.projects_dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(true) {
+                continue;
+            }
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let candidate = path.join(&jsonl_name);
+            if candidate.exists() && !is_symlink(&candidate) {
+                return Some(path);
+            }
+        }
+    }
+
+    // Original transcript is missing (deleted, or never flushed yet). Fall
+    // back to the encoded-cwd dir if it exists so live-sid lookup still
+    // has somewhere to scan.
+    if primary.is_dir() {
+        return Some(primary);
+    }
+    None
+}
+
+/// Find the currently-live session_id by scanning the project directory
+/// for the most recently modified transcript.
 ///
 /// `/clear` mints a new sessionId and a new `{sid}.jsonl` without rewriting
 /// `sessions/{PID}.json`, so the session file's sid goes stale. The fresh
 /// transcript is however always present on disk in the same project dir.
 /// `started_at_ms` filters out transcripts older than this PID's lifetime
-/// (prior runs or sibling claudes that left files behind).
-fn find_live_session_id(projects_dir: &Path, cwd: &str, started_at_ms: u64) -> Option<String> {
-    let encoded = encode_cwd_path(cwd);
-    let project_dir = projects_dir.join(&encoded);
-    let entries = fs::read_dir(&project_dir).ok()?;
+/// (prior runs or sibling claudes that left files behind). `excluded`
+/// skips sids already claimed by other active session files.
+fn find_live_session_id(
+    project_dir: Option<&Path>,
+    started_at_ms: u64,
+    excluded: &std::collections::HashSet<&str>,
+) -> Option<String> {
+    let project_dir = project_dir?;
+    let entries = fs::read_dir(project_dir).ok()?;
 
     // Allow a small grace window (5s) before started_at to tolerate clock
     // skew between the session file's startedAt and jsonl creation mtime.
@@ -868,6 +952,9 @@ fn find_live_session_id(projects_dir: &Path, cwd: &str, started_at_ms: u64) -> O
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
+        if excluded.contains(stem) {
+            continue;
+        }
         let Ok(meta) = entry.metadata() else { continue };
         let Ok(mtime) = meta.modified() else { continue };
         if mtime < min_mtime {
@@ -1747,11 +1834,13 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
             (session_path.clone(), config.clone()),
             (session_path.clone(), config),
         ];
+        let ctx = build_discovery_context(&session_paths);
         let sessions = collector.load_session_paths(
             &session_paths,
             &process_info,
             &HashMap::new(),
             &HashMap::new(),
+            &ctx,
         );
 
         assert_eq!(sessions.len(), 1);
@@ -1870,39 +1959,28 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
     }
 
     #[test]
-    fn test_find_transcript_in_config_uses_same_root_worktree_fallback() {
+    fn test_resolve_project_dir_uses_worktree_fallback() {
         let temp = tempfile::tempdir().unwrap();
         let profile = temp.path().join(".claude-work");
         let projects = profile.join("projects");
         std::fs::create_dir_all(profile.join("sessions")).unwrap();
         std::fs::create_dir_all(&projects).unwrap();
 
-        let wrong_profile = temp.path().join(".claude-other");
-        std::fs::create_dir_all(wrong_profile.join("sessions")).unwrap();
-        let wrong_projects = wrong_profile.join("projects");
-        std::fs::create_dir_all(wrong_projects.join("other-project")).unwrap();
-        std::fs::write(
-            wrong_projects.join("other-project").join("session-1.jsonl"),
-            "{}\n",
-        )
-        .unwrap();
-
+        // The transcript lives in a dir that does NOT match encode_cwd_path.
         let worktree_dir = projects.join("actual-worktree");
         std::fs::create_dir_all(&worktree_dir).unwrap();
-        let transcript = worktree_dir.join("session-1.jsonl");
-        std::fs::write(&transcript, "{}\n").unwrap();
+        std::fs::write(worktree_dir.join("session-1.jsonl"), "{}\n").unwrap();
 
         let config = ConfigDir::new(profile);
 
         assert_eq!(
-            ClaudeCollector::find_transcript_in_config(&config, "/tmp/repo", "session-1")
-                .as_deref(),
-            Some(transcript.as_path()),
+            resolve_project_dir(&config, "/tmp/repo", "session-1").as_deref(),
+            Some(worktree_dir.as_path()),
         );
     }
 
     #[test]
-    fn test_find_transcript_in_config_rejects_symlinked_exact_and_fallback_matches() {
+    fn test_resolve_project_dir_rejects_symlinked_matches() {
         let temp = tempfile::tempdir().unwrap();
         let profile = temp.path().join(".claude-work");
         let projects = profile.join("projects");
@@ -1931,12 +2009,12 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
 
         let config = ConfigDir::new(profile);
 
-        assert!(ClaudeCollector::find_transcript_in_config(
-            &config,
-            cwd.to_str().unwrap(),
-            session_id
-        )
-        .is_none());
+        // Both exact and fallback are symlinks and must be rejected. The
+        // encoded-cwd dir exists though, so the final fallback returns it.
+        assert_eq!(
+            resolve_project_dir(&config, cwd.to_str().unwrap(), session_id).as_deref(),
+            Some(exact_dir.as_path()),
+        );
     }
 
     #[test]
@@ -1969,6 +2047,7 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
         let mut collector = ClaudeCollector::new();
 
         assert_eq!(discovered.len(), 1);
+        let ctx = build_discovery_context(&discovered);
         let session = collector
             .load_session(
                 &discovered[0].0,
@@ -1976,6 +2055,7 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
                 &process_info,
                 &HashMap::new(),
                 &HashMap::new(),
+                &ctx,
             )
             .unwrap();
 
@@ -2015,9 +2095,17 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
         let children_map = HashMap::new();
         let ports = HashMap::new();
         let config = ConfigDir::new(profile);
+        let ctx = build_discovery_context(&[(session_path.clone(), config.clone())]);
 
         let session = collector
-            .load_session(&session_path, &config, &process_info, &children_map, &ports)
+            .load_session(
+                &session_path,
+                &config,
+                &process_info,
+                &children_map,
+                &ports,
+                &ctx,
+            )
             .unwrap();
 
         assert_eq!(session.session_id, session_id);
@@ -2332,10 +2420,7 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
     #[test]
     fn test_find_live_session_id_picks_newest_jsonl() {
         let temp = tempfile::tempdir().unwrap();
-        let projects = temp.path().join("projects");
-        let cwd = temp.path().join("repo");
-        std::fs::create_dir_all(&cwd).unwrap();
-        let project_dir = projects.join(encode_cwd_path(cwd.to_str().unwrap()));
+        let project_dir = temp.path().join("project");
         std::fs::create_dir_all(&project_dir).unwrap();
 
         let old_path = project_dir.join("old-sid.jsonl");
@@ -2351,7 +2436,11 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
             .as_millis() as u64)
             .saturating_sub(120_000);
 
-        let sid = find_live_session_id(&projects, cwd.to_str().unwrap(), started_ms);
+        let sid = find_live_session_id(
+            Some(project_dir.as_path()),
+            started_ms,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(sid.as_deref(), Some("new-sid"));
     }
 
@@ -2360,10 +2449,7 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
         // An old jsonl from a prior claude run in the same cwd must not be
         // picked up when started_at is more recent.
         let temp = tempfile::tempdir().unwrap();
-        let projects = temp.path().join("projects");
-        let cwd = temp.path().join("repo");
-        std::fs::create_dir_all(&cwd).unwrap();
-        let project_dir = projects.join(encode_cwd_path(cwd.to_str().unwrap()));
+        let project_dir = temp.path().join("project");
         std::fs::create_dir_all(&project_dir).unwrap();
 
         let stale = project_dir.join("abandoned.jsonl");
@@ -2377,17 +2463,83 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
             .as_millis() as u64)
             .saturating_sub(60_000);
 
-        let sid = find_live_session_id(&projects, cwd.to_str().unwrap(), started_ms);
+        let sid = find_live_session_id(
+            Some(project_dir.as_path()),
+            started_ms,
+            &std::collections::HashSet::new(),
+        );
         assert!(sid.is_none(), "expected None, got {:?}", sid);
     }
 
     #[test]
     fn test_find_live_session_id_empty_dir_returns_none() {
         let temp = tempfile::tempdir().unwrap();
-        let projects = temp.path().join("projects");
-        let cwd = temp.path().join("repo");
-        std::fs::create_dir_all(projects.join(encode_cwd_path(cwd.to_str().unwrap()))).unwrap();
-        assert!(find_live_session_id(&projects, cwd.to_str().unwrap(), 0).is_none());
+        let project_dir = temp.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        assert!(find_live_session_id(
+            Some(project_dir.as_path()),
+            0,
+            &std::collections::HashSet::new()
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_find_live_session_id_excludes_claimed_sids() {
+        // Cross-PID hijack guard: a sibling PID's jsonl (newest on disk)
+        // must not be adopted when it's in the `excluded` set.
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let mine = project_dir.join("mine.jsonl");
+        let siblings = project_dir.join("sibling.jsonl");
+        std::fs::write(&mine, "{}\n").unwrap();
+        std::fs::write(&siblings, "{}\n").unwrap();
+        set_mtime(&mine, -60);
+        set_mtime(&siblings, 0); // sibling is newer
+
+        let started_ms = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64)
+            .saturating_sub(120_000);
+
+        let mut excluded = std::collections::HashSet::new();
+        excluded.insert("sibling");
+        let sid = find_live_session_id(Some(project_dir.as_path()), started_ms, &excluded);
+        assert_eq!(sid.as_deref(), Some("mine"));
+    }
+
+    #[test]
+    fn test_find_live_session_id_grace_window_boundary() {
+        // The 5s grace window must accept a file whose mtime is slightly
+        // before started_at (clock skew). One second before started_at is in;
+        // ten seconds before is out.
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let within = project_dir.join("within-grace.jsonl");
+        std::fs::write(&within, "{}\n").unwrap();
+        set_mtime(&within, -1);
+
+        let outside = project_dir.join("outside-grace.jsonl");
+        std::fs::write(&outside, "{}\n").unwrap();
+        set_mtime(&outside, -10);
+
+        // started_at = now → 5s grace covers the -1s file but not the -10s one.
+        let started_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let sid = find_live_session_id(
+            Some(project_dir.as_path()),
+            started_ms,
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(sid.as_deref(), Some("within-grace"));
     }
 
     #[test]
@@ -2421,14 +2573,144 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
         let mut collector = ClaudeCollector::new();
         collector.config_dirs = vec![config.clone()];
 
+        let session_paths = vec![(session_path, config)];
+        let ctx = build_discovery_context(&session_paths);
         let sessions = collector.load_session_paths(
-            &[(session_path, config)],
+            &session_paths,
             &process_info,
             &HashMap::new(),
             &HashMap::new(),
+            &ctx,
         );
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, new_sid);
+        // Token counters must reflect the NEW transcript's contents, not
+        // a stale/empty state. `write_transcript` produces one assistant
+        // turn with input_tokens=12 → verify that flowed through.
+        assert_eq!(sessions[0].total_input_tokens, 12);
+    }
+
+    #[test]
+    fn test_load_session_overrides_sid_in_worktree_project_dir() {
+        // Worktree parity: when the transcript dir doesn't match
+        // encode_cwd_path(cwd), the live-sid lookup must still find the
+        // new jsonl next to the old one in the actual worktree dir.
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude");
+        let sessions = profile.join("sessions");
+        let projects = profile.join("projects");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let pid = 8888;
+        let old_sid = "worktree-old";
+        let new_sid = "worktree-new";
+
+        // Simulate a worktree session: transcripts in a dir that does NOT
+        // match encode_cwd_path(cwd).
+        let worktree_dir = projects.join("worktree-branch");
+        std::fs::create_dir_all(&worktree_dir).unwrap();
+        let old_transcript = worktree_dir.join(format!("{}.jsonl", old_sid));
+        let new_transcript = worktree_dir.join(format!("{}.jsonl", new_sid));
+        let turn_line = r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"x"}}
+{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":42,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"ok"}]}}
+"#;
+        std::fs::write(&old_transcript, turn_line).unwrap();
+        std::fs::write(&new_transcript, turn_line).unwrap();
+        set_mtime(&old_transcript, -30);
+        set_mtime(&new_transcript, 0);
+
+        let session_path = sessions.join(format!("{}.json", pid));
+        write_session_file(&session_path, pid, old_sid, &cwd);
+
+        let config = ConfigDir::new(profile.clone());
+        let process_info = make_proc_info(pid, "claude");
+        let mut collector = ClaudeCollector::new();
+        collector.config_dirs = vec![config.clone()];
+
+        let session_paths = vec![(session_path, config)];
+        let ctx = build_discovery_context(&session_paths);
+        let sessions = collector.load_session_paths(
+            &session_paths,
+            &process_info,
+            &HashMap::new(),
+            &HashMap::new(),
+            &ctx,
+        );
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, new_sid);
+        assert_eq!(sessions[0].total_input_tokens, 42);
+    }
+
+    #[test]
+    fn test_load_session_skips_override_when_multiple_pids_share_cwd() {
+        // Cross-PID hijack guard: two claude PIDs in the same cwd must keep
+        // their original session_ids even if newer jsonls exist, since we
+        // can't tell from mtime alone which one owns each file.
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude");
+        let sessions = profile.join("sessions");
+        let projects = profile.join("projects");
+        let cwd = temp.path().join("shared-repo");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let pid_a = 9001;
+        let pid_b = 9002;
+        let sid_a = "sid-a";
+        let sid_b = "sid-b";
+        let path_a = sessions.join(format!("{}.json", pid_a));
+        let path_b = sessions.join(format!("{}.json", pid_b));
+        write_session_file(&path_a, pid_a, sid_a, &cwd);
+        write_session_file(&path_b, pid_b, sid_b, &cwd);
+
+        // Both PIDs have their jsonls + a "mystery" newer one that neither
+        // session file claims. Without the guard, both PIDs would race to
+        // adopt it.
+        write_transcript(&projects, &cwd, sid_a, "a");
+        write_transcript(&projects, &cwd, sid_b, "b");
+        let mystery =
+            write_transcript(&projects, &cwd, "newer-jsonl-someone-cleared", "mystery");
+        set_mtime(&mystery, 0);
+
+        let config = ConfigDir::new(profile.clone());
+        let mut process_info = make_proc_info(pid_a, "claude");
+        process_info.insert(
+            pid_b,
+            ProcInfo {
+                pid: pid_b,
+                ppid: 1,
+                rss_kb: 2048,
+                cpu_pct: 0.0,
+                command: "claude".to_string(),
+            },
+        );
+        let mut collector = ClaudeCollector::new();
+        collector.config_dirs = vec![config.clone()];
+
+        let session_paths = vec![(path_a, config.clone()), (path_b, config)];
+        let ctx = build_discovery_context(&session_paths);
+        let sessions = collector.load_session_paths(
+            &session_paths,
+            &process_info,
+            &HashMap::new(),
+            &HashMap::new(),
+            &ctx,
+        );
+
+        let sids: std::collections::HashSet<&str> =
+            sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert!(sids.contains(sid_a), "expected sid-a, got {:?}", sids);
+        assert!(sids.contains(sid_b), "expected sid-b, got {:?}", sids);
+        assert!(
+            !sids.contains("newer-jsonl-someone-cleared"),
+            "the mystery sid must not hijack either PID: {:?}",
+            sids
+        );
     }
 }
