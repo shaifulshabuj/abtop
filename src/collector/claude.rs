@@ -1449,6 +1449,80 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_transcript_no_new_bytes_does_not_set_saw_turn() {
+        // Regression for the merge fix: a no-op poll (from_offset == file_len)
+        // must return saw_turn=false so the cached pending/thinking markers
+        // aren't clobbered by the default-zero timestamps.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(&mut file, &[
+            r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","name":"Edit","id":"t1","input":{"file_path":"x"}}]}}"#,
+        ]);
+        let file_len = std::fs::metadata(file.path()).unwrap().len();
+
+        let result = parse_transcript(file.path(), file_len);
+
+        assert!(!result.saw_turn);
+        assert_eq!(result.last_user_ts_ms, 0);
+        assert_eq!(result.last_assistant_ts_ms, 0);
+        assert_eq!(result.new_offset, file_len);
+    }
+
+    #[test]
+    fn test_parse_transcript_non_turn_lines_do_not_set_saw_turn() {
+        // A delta that only processes non-user/non-assistant entries (e.g.
+        // `summary` lines emitted on compaction) must also leave saw_turn
+        // false, so the merge step preserves the cached turn state.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(&mut file, &[
+            r#"{"type":"summary","summary":"compaction marker","leafUuid":"abc"}"#,
+        ]);
+
+        let result = parse_transcript(file.path(), 0);
+
+        assert!(!result.saw_turn);
+        assert_eq!(result.last_user_ts_ms, 0);
+        assert_eq!(result.last_assistant_ts_ms, 0);
+        assert!(result.new_offset > 0, "non-turn lines still advance offset");
+    }
+
+    #[test]
+    fn test_parse_transcript_user_then_assistant_clears_thinking_marker() {
+        // Sanity check on the mutual exclusion: after an assistant turn
+        // closes a thinking window, last_user_ts_ms must be zero and
+        // last_assistant_ts_ms must carry the assistant timestamp.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(&mut file, &[
+            r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","name":"Edit","id":"t1","input":{"file_path":"x"}}]}}"#,
+        ]);
+
+        let result = parse_transcript(file.path(), 0);
+
+        assert!(result.saw_turn);
+        assert_eq!(result.last_user_ts_ms, 0);
+        assert!(result.last_assistant_ts_ms > 0);
+    }
+
+    #[test]
+    fn test_parse_transcript_trailing_user_marks_thinking_window() {
+        // When the latest line is a user turn (prompt or tool_result),
+        // last_user_ts_ms should carry its timestamp so the UI can render
+        // the live Think row.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(&mut file, &[
+            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:00Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"ok"}]}}"#,
+            r#"{"type":"user","timestamp":"2026-03-28T15:00:10Z","message":{"role":"user","content":"next"}}"#,
+        ]);
+
+        let result = parse_transcript(file.path(), 0);
+
+        assert!(result.saw_turn);
+        assert!(result.last_user_ts_ms > 0);
+        assert_eq!(result.last_assistant_ts_ms, 0);
+    }
+
+    #[test]
     fn test_parse_lsof_process_info_captures_multiple_pids_and_cwd() {
         let output = "\
 p111
