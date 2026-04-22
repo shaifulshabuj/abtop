@@ -265,8 +265,7 @@ impl ClaudeCollector {
 
         // Resolve the project dir that actually holds this session's
         // transcripts. For worktree sessions the on-disk dir does not match
-        // `encode_cwd_path(cwd)`, so locate it via the original sid first
-        // (mirrors the fallback in `find_transcript_in_config`).
+        // `encode_cwd_path(cwd)`, so locate it via the original sid first.
         let project_dir = resolve_project_dir(config, &sf.cwd, &sf.session_id);
 
         // `/clear` mints a new sessionId + transcript without rewriting
@@ -902,8 +901,9 @@ fn build_discovery_context(
 
 /// Resolve the project directory that holds this session's transcripts.
 /// Prefers `encode_cwd_path(cwd)` but falls back to any sibling subdir
-/// containing `{original_sid}.jsonl` — this is how `find_transcript_in_config`
-/// handles worktree sessions and the live-sid lookup must stay consistent.
+/// containing `{original_sid}.jsonl` — worktree sessions live under a dir
+/// keyed by the branch name, not the encoded cwd, so both the transcript
+/// path and the live-sid lookup must resolve through this fallback.
 fn resolve_project_dir(config: &ConfigDir, cwd: &str, original_sid: &str) -> Option<PathBuf> {
     let encoded = encode_cwd_path(cwd);
     let primary = config.projects_dir.join(&encoded);
