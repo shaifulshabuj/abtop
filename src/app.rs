@@ -223,17 +223,7 @@ impl App {
             self.rate_limit_counter += 1;
         }
 
-        // Post-process: promote Waiting sessions to RateLimited when rate limits > 90%
-        let any_rate_limited = self.rate_limits.iter().any(|rl| {
-            rl.five_hour_pct.unwrap_or(0.0) > 90.0 || rl.seven_day_pct.unwrap_or(0.0) > 90.0
-        });
-        if any_rate_limited {
-            for s in &mut self.sessions {
-                if s.status == SessionStatus::Waiting {
-                    s.status = SessionStatus::RateLimited;
-                }
-            }
-        }
+        promote_waiting_to_rate_limited(&mut self.sessions, &self.rate_limits);
 
         self.drain_and_retry_summaries();
     }
@@ -715,5 +705,111 @@ fn save_summary_cache(summaries: &HashMap<String, String>) {
         if std::fs::write(&tmp, &json).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
         }
+    }
+}
+
+/// Promote Waiting sessions to RateLimited when a rate limit from the SAME
+/// agent CLI is over the 90% threshold. Matching on source avoids a
+/// Claude-only saturation freezing Codex sessions and vice versa.
+fn promote_waiting_to_rate_limited(
+    sessions: &mut [AgentSession],
+    rate_limits: &[RateLimitInfo],
+) {
+    for s in sessions.iter_mut() {
+        if s.status != SessionStatus::Waiting {
+            continue;
+        }
+        let over = rate_limits.iter().any(|rl| {
+            rl.source == s.agent_cli
+                && (rl.five_hour_pct.unwrap_or(0.0) > 90.0
+                    || rl.seven_day_pct.unwrap_or(0.0) > 90.0)
+        });
+        if over {
+            s.status = SessionStatus::RateLimited;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn waiting_session(cli: &'static str) -> AgentSession {
+        AgentSession {
+            agent_cli: cli,
+            pid: 1,
+            session_id: String::new(),
+            cwd: String::new(),
+            project_name: String::new(),
+            started_at: 0,
+            status: SessionStatus::Waiting,
+            model: String::new(),
+            effort: String::new(),
+            context_percent: 0.0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cache_read: 0,
+            total_cache_create: 0,
+            turn_count: 0,
+            compaction_count: 0,
+            current_tasks: vec![],
+            version: String::new(),
+            git_branch: String::new(),
+            mem_mb: 0,
+            token_history: vec![],
+            context_history: vec![],
+            context_window: 0,
+            subagents: vec![],
+            mem_file_count: 0,
+            mem_line_count: 0,
+            children: vec![],
+            initial_prompt: String::new(),
+            first_assistant_text: String::new(),
+            tool_calls: vec![],
+            pending_since_ms: 0,
+            thinking_since_ms: 0,
+            file_accesses: vec![],
+            git_added: 0,
+            git_modified: 0,
+        }
+    }
+
+    fn rate_limit(source: &str, pct: f64) -> RateLimitInfo {
+        RateLimitInfo {
+            source: source.to_string(),
+            five_hour_pct: Some(pct),
+            five_hour_resets_at: None,
+            seven_day_pct: None,
+            seven_day_resets_at: None,
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn test_rate_limited_promotion_is_per_agent_cli() {
+        // Claude is saturated, Codex is not. Only the Claude session should
+        // be promoted.
+        let mut sessions = vec![waiting_session("claude"), waiting_session("codex")];
+        let limits = vec![rate_limit("claude", 95.0)];
+        promote_waiting_to_rate_limited(&mut sessions, &limits);
+        assert_eq!(sessions[0].status, SessionStatus::RateLimited);
+        assert_eq!(sessions[1].status, SessionStatus::Waiting);
+    }
+
+    #[test]
+    fn test_rate_limited_promotion_ignores_below_threshold() {
+        let mut sessions = vec![waiting_session("claude")];
+        let limits = vec![rate_limit("claude", 89.9)];
+        promote_waiting_to_rate_limited(&mut sessions, &limits);
+        assert_eq!(sessions[0].status, SessionStatus::Waiting);
+    }
+
+    #[test]
+    fn test_rate_limited_promotion_skips_non_waiting_sessions() {
+        let mut sessions = vec![waiting_session("claude")];
+        sessions[0].status = SessionStatus::Thinking;
+        let limits = vec![rate_limit("claude", 99.0)];
+        promote_waiting_to_rate_limited(&mut sessions, &limits);
+        assert_eq!(sessions[0].status, SessionStatus::Thinking);
     }
 }

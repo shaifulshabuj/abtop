@@ -476,7 +476,13 @@ impl ClaudeCollector {
                 //    (higher threshold avoids false positives from idle watchers/servers)
                 let has_active_descendant =
                     process::has_active_descendant(sf.pid, children_map, process_info, 5.0);
-                if has_active_descendant || has_tool {
+                // `has_tool` alone is not enough to infer Executing on a stale
+                // transcript: a session whose final assistant turn ended on a
+                // tool_use and then died (interrupted/crashed) keeps
+                // current_task non-empty forever. Only trust it when paired
+                // with live CPU activity on a descendant (the tool actually
+                // running) to avoid a permanent false-positive Executing.
+                if has_active_descendant {
                     SessionStatus::Executing
                 } else if claude_cpu_active {
                     SessionStatus::Thinking
