@@ -1390,9 +1390,15 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
                                 result.last_assistant_ts_ms = 0;
                             }
                             // Mark the start of a thinking window — next assistant
-                            // turn clears it. Covers both prompts and tool_result
-                            // lines (both serialize as `user` type).
-                            if entry_ts_ms > 0 {
+                            // turn clears it. **Skip tool_result wrappers**:
+                            // Claude Code serializes both real prompts and tool
+                            // results as `user`-role lines, but only real prompts
+                            // mean "model has been asked, no reply yet". A tool
+                            // loop alternates assistant(tool_use) ↔ user(tool_result)
+                            // inside one logical turn, and treating each
+                            // tool_result as the start of a new thinking window
+                            // makes the status flicker Think ↔ Wait per tool call.
+                            if entry_ts_ms > 0 && !is_tool_result_user_msg(val.get("message")) {
                                 result.last_user_ts_ms = entry_ts_ms;
                             }
                             result.saw_turn = true;
@@ -1433,6 +1439,28 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
 /// Handles both string content and array-of-blocks content.
 /// Encode a cwd path to match Claude Code's project directory naming.
 /// Claude Code replaces '/', '_', and '.' with '-'.
+/// True iff a `user`-role transcript message is a tool_result wrapper
+/// (Claude Code returns tool outputs to the model as user-role messages
+/// whose content blocks are `{type: "tool_result", ...}`). Used to keep
+/// tool loops from flickering the Thinking status: only real prompts
+/// should open a new thinking window.
+///
+/// Conservative: returns true only when the message has content blocks
+/// AND every block is a tool_result. A mixed block message is treated
+/// as a real prompt so we never silently swallow user input.
+fn is_tool_result_user_msg(message: Option<&Value>) -> bool {
+    let Some(message) = message else { return false };
+    let Some(Value::Array(arr)) = message.get("content") else {
+        return false;
+    };
+    if arr.is_empty() {
+        return false;
+    }
+    arr.iter().all(|block| {
+        block.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+    })
+}
+
 fn encode_cwd_path(cwd: &str) -> String {
     cwd.chars()
         .map(|c| match c {
@@ -1712,6 +1740,35 @@ mod tests {
         assert_eq!(result.last_user_ts_ms, 0);
         assert_eq!(result.last_assistant_ts_ms, 0);
         assert!(result.new_offset > 0, "non-turn lines still advance offset");
+    }
+
+    #[test]
+    fn test_parse_transcript_tool_result_does_not_open_thinking_window() {
+        // Regression: status used to flicker Think ↔ Wait during tool
+        // loops because tool_result lines come back as `user`-role
+        // messages, and the parser treated them as the start of a new
+        // thinking window. Real flow:
+        //   1. assistant(tool_use) → last_user cleared (Wait)
+        //   2. user(tool_result)   → last_user set    (Think) ← bug
+        //   3. assistant(next)     → last_user cleared (Wait)
+        // Fix: skip tool_result wrappers when updating last_user_ts_ms.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(&mut file, &[
+            r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:01Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","name":"Bash","id":"t1","input":{"command":"ls"}}]}}"#,
+            r#"{"type":"user","timestamp":"2026-03-28T15:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"a\nb"}]}}"#,
+        ]);
+
+        let result = parse_transcript(file.path(), 0);
+
+        assert!(result.saw_turn);
+        // After the tool_result line, last_user_ts_ms must STILL be 0
+        // — the assistant turn at 15:00:01 cleared it, and the
+        // tool_result wrapper at 15:00:02 must not re-open the window.
+        assert_eq!(
+            result.last_user_ts_ms, 0,
+            "tool_result user-role line must not reopen the thinking window",
+        );
     }
 
     #[test]
