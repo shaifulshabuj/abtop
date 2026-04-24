@@ -2,12 +2,16 @@ use std::path::PathBuf;
 
 pub struct AppConfig {
     pub theme: String,
+    /// Agent CLI names to exclude from the TUI (e.g. ["codex"] to hide Codex).
+    /// Matched case-insensitively against each collector's agent_cli identifier.
+    pub hidden_agents: Vec<String>,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             theme: "btop".to_string(),
+            hidden_agents: Vec::new(),
         }
     }
 }
@@ -42,6 +46,10 @@ pub fn load_config() -> AppConfig {
             } else {
                 val
             };
+            if key == "hidden_agents" {
+                config.hidden_agents = parse_string_array(val);
+                continue;
+            }
             let val = val.trim_matches('"').trim_matches('\'');
             if key == "theme" {
                 config.theme = val.to_string();
@@ -49,6 +57,20 @@ pub fn load_config() -> AppConfig {
         }
     }
     config
+}
+
+/// Parse a simple one-line TOML string array like `["a", "b"]`.
+/// Returns an empty Vec for malformed input to keep config loading infallible.
+fn parse_string_array(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
+        return Vec::new();
+    };
+    inner
+        .split(',')
+        .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 pub fn save_theme(name: &str) -> Result<(), String> {
@@ -80,4 +102,33 @@ pub fn save_theme(name: &str) -> Result<(), String> {
         lines.push(format!("theme = \"{}\"", name));
     }
     std::fs::write(&path, lines.join("\n") + "\n").map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_string_array_basic() {
+        assert_eq!(parse_string_array(r#"["codex"]"#), vec!["codex"]);
+        assert_eq!(
+            parse_string_array(r#"["codex", "claude"]"#),
+            vec!["codex", "claude"]
+        );
+    }
+
+    #[test]
+    fn parse_string_array_quote_styles_and_whitespace() {
+        assert_eq!(
+            parse_string_array(r#"[ 'codex' , "claude" ]"#),
+            vec!["codex", "claude"]
+        );
+    }
+
+    #[test]
+    fn parse_string_array_empty_and_malformed() {
+        assert!(parse_string_array("[]").is_empty());
+        assert!(parse_string_array("not an array").is_empty());
+        assert!(parse_string_array(r#"["a",,]"#).iter().all(|s| !s.is_empty()) );
+    }
 }

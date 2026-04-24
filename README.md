@@ -105,6 +105,17 @@ Colorblind-friendly themes:
 |:-:|:-:|
 | ![deuteranopia](assets/themes/deuteranopia.png) | ![tritanopia](assets/themes/tritanopia.png) |
 
+## Configuration
+
+`~/.config/abtop/config.toml` supports:
+
+```toml
+theme = "btop"
+# Hide specific agent CLIs from the TUI (case-insensitive).
+# Useful if you only use one agent and want a cleaner view.
+hidden_agents = ["codex"]
+```
+
 ## Key Bindings
 
 | Key                | Action                               |
