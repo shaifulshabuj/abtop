@@ -167,28 +167,17 @@ impl CodexCollector {
         // so task_complete alone does NOT mean the session is finished when PID is alive.
         // However, for exec (one-shot) sessions, task_complete means truly done.
         let pid_alive = proc.is_some();
-        let has_tool = !result.current_task.is_empty();
+        // CPU-driven status (mirrors Claude). Transcript mtime alone
+        // misclassified just-finished turns as "active" — only real CPU
+        // signals reliably distinguish thinking from idle.
         let status = if !pid_alive || (is_exec && result.task_complete) {
             SessionStatus::Done
         } else {
-            let since_activity = std::time::SystemTime::now()
-                .duration_since(result.last_activity)
-                .unwrap_or_default();
-            if since_activity.as_secs() < 30 {
-                if has_tool {
-                    SessionStatus::Executing
-                } else if result.model_generating {
-                    SessionStatus::Thinking
-                } else {
-                    SessionStatus::Waiting
-                }
-            } else {
-                let cpu_active = proc.is_some_and(|p| p.cpu_pct > 1.0);
-                let has_active_child = pid.is_some_and(|p| {
-                    process::has_active_descendant(p, children_map, process_info, 5.0)
-                });
-                super::stale_status(has_active_child, cpu_active)
-            }
+            let cpu_active = proc.is_some_and(|p| p.cpu_pct > 1.0);
+            let has_active_child = pid.is_some_and(|p| {
+                process::has_active_descendant(p, children_map, process_info, 5.0)
+            });
+            super::stale_status(has_active_child, cpu_active)
         };
 
         // Current task from last tool use
@@ -386,10 +375,6 @@ struct CodexJSONLResult {
     turn_count: u32,
     current_task: String,
     task_complete: bool,
-    /// True iff the latest event in the rollout is a `user_message` with no
-    /// `agent_message` after it. Mirrors Claude's `last_user_ts_ms > 0`
-    /// signal: the model is actually generating a reply, not just idle.
-    model_generating: bool,
     last_activity: std::time::SystemTime,
     initial_prompt: String,
     total_input: u64,
@@ -428,7 +413,6 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
         turn_count: 0,
         current_task: String::new(),
         task_complete: false,
-        model_generating: false,
         last_activity: std::time::UNIX_EPOCH,
         initial_prompt: String::new(),
         total_input: 0,
@@ -511,15 +495,10 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
                             result.context_window = cw;
                         }
                     }
-                    Some("user_message") => {
-                        // Latest event is a user prompt — the model has not
-                        // yet emitted an agent_message in response.
-                        result.model_generating = true;
-                        if result.initial_prompt.is_empty() {
-                            if let Some(msg) = payload["message"].as_str() {
-                                let truncated: String = msg.chars().take(120).collect();
-                                result.initial_prompt = super::redact_secrets(&truncated);
-                            }
+                    Some("user_message") if result.initial_prompt.is_empty() => {
+                        if let Some(msg) = payload["message"].as_str() {
+                            let truncated: String = msg.chars().take(120).collect();
+                            result.initial_prompt = super::redact_secrets(&truncated);
                         }
                     }
                     Some("token_count") => {
@@ -585,12 +564,9 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
                     }
                     Some("agent_message") => {
                         result.turn_count += 1;
-                        // Agent replied → close any pending Thinking window.
-                        result.model_generating = false;
                     }
                     Some("task_complete") => {
                         result.task_complete = true;
-                        result.model_generating = false;
                     }
                     _ => {}
                 }
@@ -729,36 +705,6 @@ mod tests {
         let result = parse_codex_jsonl(file.path()).unwrap();
         // Bad line skipped, agent_message still counted
         assert_eq!(result.turn_count, 1);
-    }
-
-    #[test]
-    fn test_parse_codex_model_generating_after_user_message() {
-        // Latest event is a user_message → the model has not replied yet,
-        // so model_generating must be true. Drives the < 30s Thinking
-        // status branch in CodexCollector::collect_sessions.
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        write_lines(&mut file, &[
-            SESSION_META,
-            r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"agent_message","message":"hi"}}"#,
-            r#"{"type":"event_msg","timestamp":"2026-03-28T15:02:00Z","payload":{"type":"user_message","message":"do a thing"}}"#,
-        ]);
-        let result = parse_codex_jsonl(file.path()).unwrap();
-        assert!(result.model_generating, "trailing user_message must mark model as generating");
-    }
-
-    #[test]
-    fn test_parse_codex_model_generating_cleared_by_agent_message() {
-        // user_message followed by agent_message → reply landed, the
-        // session is idle. Without the reset the < 30s status branch
-        // would misfire Thinking on every just-finished turn.
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        write_lines(&mut file, &[
-            SESSION_META,
-            r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"user_message","message":"do a thing"}}"#,
-            r#"{"type":"event_msg","timestamp":"2026-03-28T15:02:00Z","payload":{"type":"agent_message","message":"done"}}"#,
-        ]);
-        let result = parse_codex_jsonl(file.path()).unwrap();
-        assert!(!result.model_generating, "agent_message must close the thinking window");
     }
 
     #[test]
